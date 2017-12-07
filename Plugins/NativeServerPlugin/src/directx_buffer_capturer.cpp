@@ -11,6 +11,7 @@ using namespace StreamingToolkit;
 DirectXBufferCapturer::DirectXBufferCapturer(ID3D11Device* d3d_device) :
 	d3d_device_(d3d_device)
 {
+	memset(staging_frame_buffers_, 0, MAX_STAGING_BUFFERS * sizeof(ID3D11Texture2D*));
 }
 
 void DirectXBufferCapturer::Initialize()
@@ -39,7 +40,13 @@ void DirectXBufferCapturer::SendFrame(ID3D11Texture2D* frame_buffer)
 	}
 
 	// Updates staging frame buffer.
-	UpdateStagingBuffer(frame_buffer);
+	ID3D11Texture2D* staging_buffer = UpdateStagingBuffer(frame_buffer);
+
+	// Returns if there is no available staging buffer.
+	if (!staging_buffer)
+	{
+		return;
+	}
 
 	for each (auto sink in sinks_)
 	{
@@ -54,7 +61,7 @@ void DirectXBufferCapturer::SendFrame(ID3D11Texture2D* frame_buffer)
 		{
 			D3D11_MAPPED_SUBRESOURCE mapped;
 			if (SUCCEEDED(d3d_context_.Get()->Map(
-				staging_frame_buffer_.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
+				staging_buffer, 0, D3D11_MAP_READ, 0, &mapped)))
 			{
 				libyuv::ABGRToI420(
 					(uint8_t*)mapped.pData,
@@ -68,7 +75,7 @@ void DirectXBufferCapturer::SendFrame(ID3D11Texture2D* frame_buffer)
 					desc.Width,
 					desc.Height);
 
-				d3d_context_->Unmap(staging_frame_buffer_.Get(), 0);
+				d3d_context_->Unmap(staging_buffer, 0);
 			}
 		}
 
@@ -84,13 +91,8 @@ void DirectXBufferCapturer::SendFrame(ID3D11Texture2D* frame_buffer)
 		// For hardware encoder, setting the video frame texture.
 		if (!use_software_encoder_)
 		{
-			// Clones the frame buffer before sending to the encoder.
-			ID3D11Texture2D* frame_buffer_clone;
-			d3d_device_->CreateTexture2D(
-				&staging_frame_buffer_desc_, nullptr, &frame_buffer_clone);
-
-			d3d_context_->CopyResource(frame_buffer_clone, staging_frame_buffer_.Get());
-			frame.SetID3D11Texture2D(frame_buffer_clone);
+			staging_buffer->AddRef();
+			frame.SetID3D11Texture2D(staging_buffer);
 		}
 
 		// Sending video frame.
@@ -98,36 +100,69 @@ void DirectXBufferCapturer::SendFrame(ID3D11Texture2D* frame_buffer)
 	}
 }
 
-void DirectXBufferCapturer::UpdateStagingBuffer(ID3D11Texture2D* frame_buffer)
+ID3D11Texture2D* DirectXBufferCapturer::UpdateStagingBuffer(ID3D11Texture2D* frame_buffer)
 {
-	D3D11_TEXTURE2D_DESC desc;
-	frame_buffer->GetDesc(&desc);
-
-	// Lazily initializes the staging frame buffer.
-	if (!staging_frame_buffer_)
+	// Finds any available staging frame buffer.
+	int buffer_id = 0;
+	do
 	{
-		staging_frame_buffer_desc_ = { 0 };
-		staging_frame_buffer_desc_.ArraySize = 1;
-		staging_frame_buffer_desc_.Format = desc.Format;
-		staging_frame_buffer_desc_.Width = desc.Width;
-		staging_frame_buffer_desc_.Height = desc.Height;
-		staging_frame_buffer_desc_.MipLevels = 1;
-		staging_frame_buffer_desc_.SampleDesc.Count = 1;
-		staging_frame_buffer_desc_.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-		staging_frame_buffer_desc_.Usage = D3D11_USAGE_STAGING;
-		d3d_device_->CreateTexture2D(
-			&staging_frame_buffer_desc_, nullptr, &staging_frame_buffer_);
+		if (!staging_frame_buffers_[buffer_id])
+		{
+			break;
+		}
+		else
+		{
+			staging_frame_buffers_[buffer_id]->AddRef();
+			int ref_count = staging_frame_buffers_[buffer_id]->Release();
+			if (ref_count == 1)
+			{
+				break;
+			}
+		}
 	}
-	// Resizes if needed.
-	else if (staging_frame_buffer_desc_.Width != desc.Width || 
-		staging_frame_buffer_desc_.Height != desc.Height)
+	while (++buffer_id < MAX_STAGING_BUFFERS);
+
+	if (buffer_id != MAX_STAGING_BUFFERS)
 	{
-		staging_frame_buffer_desc_.Width = desc.Width;
-		staging_frame_buffer_desc_.Height = desc.Height;
-		d3d_device_->CreateTexture2D(&staging_frame_buffer_desc_, nullptr,
-			&staging_frame_buffer_);
+		// Gets frame buffer description.
+		D3D11_TEXTURE2D_DESC desc;
+		frame_buffer->GetDesc(&desc);
+
+		// Lazily creates staging frame buffer.
+		if (!staging_frame_buffers_[buffer_id])
+		{
+			D3D11_TEXTURE2D_DESC staging_frame_buffer_desc = { 0 };
+			staging_frame_buffer_desc.ArraySize = 1;
+			staging_frame_buffer_desc.Format = desc.Format;
+			staging_frame_buffer_desc.Width = desc.Width;
+			staging_frame_buffer_desc.Height = desc.Height;
+			staging_frame_buffer_desc.MipLevels = 1;
+			staging_frame_buffer_desc.SampleDesc.Count = 1;
+			staging_frame_buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			staging_frame_buffer_desc.Usage = D3D11_USAGE_STAGING;
+			d3d_device_->CreateTexture2D(
+				&staging_frame_buffer_desc, nullptr, &staging_frame_buffers_[buffer_id]);
+		}
+		else // Resizes if needed.
+		{
+			D3D11_TEXTURE2D_DESC staging_frame_buffer_desc;
+			staging_frame_buffers_[buffer_id]->GetDesc(&staging_frame_buffer_desc);
+			if (staging_frame_buffer_desc.Width != desc.Width ||
+				staging_frame_buffer_desc.Height != desc.Height)
+			{
+				staging_frame_buffer_desc.Width = desc.Width;
+				staging_frame_buffer_desc.Height = desc.Height;
+				staging_frame_buffers_[buffer_id]->Release();
+				d3d_device_->CreateTexture2D(&staging_frame_buffer_desc, nullptr,
+					&staging_frame_buffers_[buffer_id]);
+			}
+		}
+
+		// Copies the frame buffer to the staging one.
+		d3d_context_->CopyResource(staging_frame_buffers_[buffer_id], frame_buffer);
+
+		return staging_frame_buffers_[buffer_id];
 	}
 
-	// Copies the frame buffer to the staging one.		
-	d3d_context_->CopyResource(staging_frame_buffer_.Get(), frame_buffer);
+	return nullptr;
 }
