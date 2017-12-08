@@ -9,15 +9,19 @@
 #include "peer_connection_client.h"
 #include "peer_conductor.hpp"
 
+#include "webrtc/base/sigslot.h"
+
 using namespace StreamingToolkit;
 
 using namespace std;
 using namespace rtc;
 using namespace webrtc;
+using namespace sigslot;
 
 class MultiPeerConductor : public PeerConnectionClientObserver,
 	public MessageHandler,
-	public Runnable
+	public Runnable,
+	public has_slots<>
 {
 public:
 	MultiPeerConductor(shared_ptr<WebRTCConfig> config,
@@ -44,6 +48,16 @@ public:
 		m_signallingClient.Connect(m_webrtcConfig->server, m_webrtcConfig->port, clientName);
 	}
 
+	// each peer can emit a signal that will in turn call this method
+	void OnIceConnectionChange(int peer_id, PeerConnectionInterface::IceConnectionState new_state)
+	{
+		// peer disconnected
+		if (new_state == PeerConnectionInterface::IceConnectionState::kIceConnectionDisconnected)
+		{
+			m_connectedPeers.erase(peer_id);
+		}
+	}
+
 	virtual void OnSignedIn() override
 	{
 		m_shouldProcessQueue.store(true);
@@ -67,6 +81,8 @@ public:
 		},
 			m_d3dDevice,
 			m_enableSoftware);
+
+		m_connectedPeers[id]->SignalIceConnectionChange.connect(this, &MultiPeerConductor::OnIceConnectionChange);
 	}
 
 	virtual void OnPeerDisconnected(int peer_id) override
